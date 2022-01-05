@@ -1,39 +1,3 @@
-// This is an advanced implementation of the algorithm described in the following paper:
-//   J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time.
-//     Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014. 
-
-// Modifier: Tong Qin               qintonguav@gmail.com
-// 	         Shaozu Cao 		    saozu.cao@connect.ust.hk
-
-
-// Copyright 2013, Ji Zhang, Carnegie Mellon University
-// Further contributions copyright (c) 2016, Southwest Research Institute
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-//    this list of conditions and the following disclaimer.
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-//    this list of conditions and the following disclaimer in the documentation
-//    and/or other materials provided with the distribution.
-// 3. Neither the name of the copyright holder nor the names of its
-//    contributors may be used to endorse or promote products derived from this
-//    software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
-
 #include <cmath>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
@@ -61,7 +25,7 @@
 
 int corner_correspondence = 0, plane_correspondence = 0;
 
-constexpr double SCAN_PERIOD = 0.1;
+constexpr double SCAN_PERIOD = 0.1;   // 指100ms
 constexpr double DISTANCE_SQ_THRESHOLD = 25;
 constexpr double NEARBY_SCAN = 2.5;
 
@@ -89,37 +53,48 @@ pcl::PointCloud<PointType>::Ptr laserCloudFullRes(new pcl::PointCloud<PointType>
 int laserCloudCornerLastNum = 0;
 int laserCloudSurfLastNum = 0;
 
+// q_w_curr 是 Lidar Odometry线程估计的frame在world坐标系的位姿P
 // Transformation from current frame to world frame
 Eigen::Quaterniond q_w_curr(1, 0, 0, 0);
 Eigen::Vector3d t_w_curr(0, 0, 0);
 
 // q_curr_last(x, y, z, w), t_curr_last
+// 点云特征匹配时的优化变量
 double para_q[4] = {0, 0, 0, 1};
 double para_t[3] = {0, 0, 0};
 
-Eigen::Map<Eigen::Quaterniond> q_last_curr(para_q);
-Eigen::Map<Eigen::Vector3d> t_last_curr(para_t);
+// 下面的2个分别是优化变量 para_q 和 para_t 的映射：表示的是
+// world坐标系下的两个位姿P之间的增量，例如 △P = P0.inverse() * P1
+Eigen::Map<Eigen::Quaterniond>  q_last_curr(para_q);
+Eigen::Map<Eigen::Vector3d>  t_last_curr(para_t);
 
 std::queue<sensor_msgs::PointCloud2ConstPtr> cornerSharpBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> cornerLessSharpBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> surfFlatBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> surfLessFlatBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullPointsBuf;
+
 std::mutex mBuf;
 
-// undistort lidar point
+
+// undistort lidar point 所有点补偿到起始时刻
+// 将当前帧Lidar坐标系下的点云变换到上一帧Lidar坐标系下（也就是当前帧的初始位姿）
 void TransformToStart(PointType const *const pi, PointType *const po)
 {
     //interpolation ratio
     double s;
-    // 由于kitti数据集上的lidar已经做过了运动补偿，因此这里就不做具体补偿了
+    //由于kitti数据集上的lidar已经做过了运动补偿，因此这里就不做具体补偿了
+    // 时间差/时间周期，占时间周期的比例
     if (DISTORTION)
         s = (pi->intensity - int(pi->intensity)) / SCAN_PERIOD;
     else
-        s = 1.0;    // s = 1s说明全部补偿到点云结束的时刻
-    //s = 1;
+        s = 1.0;    // s = 1s 说明全部补偿到点云结束的时刻
+
     // 所有点的操作方式都是一致的，相当于从结束时刻补偿到起始时刻
     // 这里相当于是一个匀速模型的假设
+    // q_last_curr 看做单位四元数，t_last_curr 看作零向量
+    /* 如果点云没有去除畸变，用slerp计算出每个点在fire时刻的位姿，然后进行TransformToStart的坐标变换
+    一方面变换到上一帧Lidar坐标系下；另外也可以理解成点都将fire时刻统一到了开始时刻，即去除了畸变，完成了运动补偿*/
     Eigen::Quaterniond q_point_last = Eigen::Quaterniond::Identity().slerp(s, q_last_curr);
     Eigen::Vector3d t_point_last = s * t_last_curr;
     Eigen::Vector3d point(pi->x, pi->y, pi->z);
@@ -131,11 +106,11 @@ void TransformToStart(PointType const *const pi, PointType *const po)
     po->intensity = pi->intensity;
 }
 
-// transform all lidar points to the start of the next frame
 
+// transform all lidar points to the start of the next frame
 void TransformToEnd(PointType const *const pi, PointType *const po)
 {
-    // undistort point first
+    // undistort point first 先都补偿到起始时刻
     pcl::PointXYZI un_point_tmp;
     TransformToStart(pi, &un_point_tmp);
 
@@ -149,7 +124,8 @@ void TransformToEnd(PointType const *const pi, PointType *const po)
     //Remove distortion time info
     po->intensity = int(pi->intensity);
 }
-// 操作都是送去各自的队列中
+
+// 下面5个回调函数操作都是送去各自的队列中
 void laserCloudSharpHandler(const sensor_msgs::PointCloud2ConstPtr &cornerPointsSharp2)
 {
     mBuf.lock();
@@ -194,15 +170,12 @@ int main(int argc, char **argv)
     nh.param<int>("mapping_skip_frame", skipFrameNum, 2);
 
     printf("Mapping %d Hz \n", 10 / skipFrameNum);
-    // 订阅提取出来的点云
+    // 订阅 scanRegistration 提取出来的点云
     ros::Subscriber subCornerPointsSharp = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_sharp", 100, laserCloudSharpHandler);
-
     ros::Subscriber subCornerPointsLessSharp = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_less_sharp", 100, laserCloudLessSharpHandler);
-
     ros::Subscriber subSurfPointsFlat = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_flat", 100, laserCloudFlatHandler);
-
     ros::Subscriber subSurfPointsLessFlat = nh.subscribe<sensor_msgs::PointCloud2>("/laser_cloud_less_flat", 100, laserCloudLessFlatHandler);
-
+    // 写死为订阅 velodyne 雷达点云
     ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_2", 100, laserCloudFullResHandler);
 
     ros::Publisher pubLaserCloudCornerLast = nh.advertise<sensor_msgs::PointCloud2>("/laser_cloud_corner_last", 100);
@@ -227,7 +200,7 @@ int main(int argc, char **argv)
         // 首先确保订阅的五个消息都有，有一个队列为空都不行
         if (!cornerSharpBuf.empty() && !cornerLessSharpBuf.empty() &&
             !surfFlatBuf.empty() && !surfLessFlatBuf.empty() &&
-            !fullPointsBuf.empty())
+            !fullPointsBuf.empty()  )
         {
             // 分别求出队列第一个时间
             timeCornerPointsSharp = cornerSharpBuf.front()->header.stamp.toSec();
@@ -235,7 +208,8 @@ int main(int argc, char **argv)
             timeSurfPointsFlat = surfFlatBuf.front()->header.stamp.toSec();
             timeSurfPointsLessFlat = surfLessFlatBuf.front()->header.stamp.toSec();
             timeLaserCloudFullRes = fullPointsBuf.front()->header.stamp.toSec();
-            // 因为同一帧的时间戳都是相同的，因此这里比较是否是同一帧
+
+            // 比较是否是同一帧，一般都是同一帧
             if (timeCornerPointsSharp != timeLaserCloudFullRes ||
                 timeCornerPointsLessSharp != timeLaserCloudFullRes ||
                 timeSurfPointsFlat != timeLaserCloudFullRes ||
@@ -267,43 +241,47 @@ int main(int argc, char **argv)
             fullPointsBuf.pop();
             mBuf.unlock();
 
+
             TicToc t_whole;
-            // initializing
-            // 一个什么也不干的初始化
+            // 一个什么也不干的初始化，跳过第一帧，否则无法比较
             if (!systemInited)
             {
                 systemInited = true;
                 std::cout << "Initialization finished \n";
             }
-            else
+            else   //用当前帧的角点和面点，与上一帧的角点和面点建立约束
             {
-                // 取出比较突出的特征
+                // 取出比较突出的特征，角点和面点
                 int cornerPointsSharpNum = cornerPointsSharp->points.size();
                 int surfPointsFlatNum = surfPointsFlat->points.size();
 
                 TicToc t_opt;
-                // 进行两次迭代
+                // 进行两次迭代求解   点到线以及点到面的ICP，迭代2次
                 for (size_t opti_counter = 0; opti_counter < 2; ++opti_counter)
                 {
                     corner_correspondence = 0;
                     plane_correspondence = 0;
 
                     //ceres::LossFunction *loss_function = NULL;
-                    // 定义一下ceres的核函数
+                    // 定义ceres的核函数，残差大于0.1则降低其权重
                     ceres::LossFunction *loss_function = new ceres::HuberLoss(0.1);
-                    // 由于旋转不满足一般意义的加法，因此这里使用ceres自带的local param
+                    /*  由于旋转不满足一般意义的加法，因此这里使用ceres自带的local param
+                    自己定义“加法”  */
                     ceres::LocalParameterization *q_parameterization =
                         new ceres::EigenQuaternionParameterization();
                     ceres::Problem::Options problem_options;
 
                     ceres::Problem problem(problem_options);
-                    // 待优化的变量是帧间位姿，平移和旋转，这里旋转使用四元数来表示
+                    /* 待优化的变量是帧间位姿，平移和旋转，这里旋转使用四元数来表示
+                    普通的ceres使用并不用这么设置，直接最终AddResidual就可以
+                    重构参数，优化时实际使用的是3维的等效旋转矢量，避免计算资源的浪费
+                    如果不用q_parameterization，四元数优化时会直接发散 */
                     problem.AddParameterBlock(para_q, 4, q_parameterization);
                     problem.AddParameterBlock(para_t, 3);
 
-                    pcl::PointXYZI pointSel;
-                    std::vector<int> pointSearchInd;
-                    std::vector<float> pointSearchSqDis;
+                    pcl::PointXYZI  pointSel;
+                    std::vector<int>  pointSearchInd;
+                    std::vector<float>  pointSearchSqDis;
 
                     TicToc t_data;
                     // find correspondence for corner features
@@ -320,7 +298,7 @@ int main(int argc, char **argv)
                         if (pointSearchSqDis[0] < DISTANCE_SQ_THRESHOLD)
                         {
                             closestPointInd = pointSearchInd[0];    // 对应的最近距离的索引取出来
-                            // 找到其所在线束id，线束信息藏在intensity的整数部分
+                            // 找到其所在线束id， 线束信息藏在intensity的整数部分
                             int closestPointScanID = int(laserCloudCornerLast->points[closestPointInd].intensity);
 
                             double minPointSqDis2 = DISTANCE_SQ_THRESHOLD;
@@ -406,7 +384,7 @@ int main(int argc, char **argv)
                         }
                     }
 
-                    // find correspondence for plane features
+                    // find correspondence for plane features 寻找面点约束
                     for (int i = 0; i < surfPointsFlatNum; ++i)
                     {
                         TransformToStart(&(surfPointsFlat->points[i]), &pointSel);
@@ -520,7 +498,7 @@ int main(int argc, char **argv)
                     // 如果总的约束太少，就打印一下
                     if ((corner_correspondence + plane_correspondence) < 10)
                     {
-                        printf("less correspondence! *************************************************\n");
+                        printf("less correspondence! \n");
                     }
                     // 调用ceres求解器求解
                     TicToc t_solver;
@@ -539,9 +517,8 @@ int main(int argc, char **argv)
             }
 
             TicToc t_pub;
-            // 发布lidar里程记结果
-            // publish odometry
-            nav_msgs::Odometry laserOdometry;
+            // publish odometry   发布lidar里程记结果
+            nav_msgs::Odometry  laserOdometry;
             laserOdometry.header.frame_id = "/camera_init";
             laserOdometry.child_frame_id = "/laser_odom";
             laserOdometry.header.stamp = ros::Time().fromSec(timeSurfPointsLessFlat);
@@ -555,9 +532,10 @@ int main(int argc, char **argv)
             laserOdometry.pose.pose.position.z = t_w_curr.z();
             pubLaserOdometry.publish(laserOdometry);
 
-            geometry_msgs::PoseStamped laserPose;
+            geometry_msgs::PoseStamped  laserPose;
             laserPose.header = laserOdometry.header;
             laserPose.pose = laserOdometry.pose.pose;
+
             laserPath.header.stamp = laserOdometry.header.stamp;
             laserPath.poses.push_back(laserPose);
             laserPath.header.frame_id = "/camera_init";
@@ -585,7 +563,7 @@ int main(int argc, char **argv)
                 }
             }
 
-            pcl::PointCloud<PointType>::Ptr laserCloudTemp = cornerPointsLessSharp;
+            pcl::PointCloud<PointType>::Ptr  laserCloudTemp = cornerPointsLessSharp;
             cornerPointsLessSharp = laserCloudCornerLast;
             laserCloudCornerLast = laserCloudTemp;
 
@@ -596,11 +574,11 @@ int main(int argc, char **argv)
             laserCloudCornerLastNum = laserCloudCornerLast->points.size();
             laserCloudSurfLastNum = laserCloudSurfLast->points.size();
 
-            // std::cout << "the size of corner last is " << laserCloudCornerLastNum << ", and the size of surf last is " << laserCloudSurfLastNum << '\n';
-            // kdtree设置当前帧，用来下一帧lidar odom使用
+            std::cout << "the size of corner last is " << laserCloudCornerLastNum << ", and the size of surf last is " << laserCloudSurfLastNum << '\n';
+            // kdtree设置当前帧，用于下一帧lidar odom使用
             kdtreeCornerLast->setInputCloud(laserCloudCornerLast);
             kdtreeSurfLast->setInputCloud(laserCloudSurfLast);
-            // 一定降频后给后端发送
+            // 降频后发布3个话题给后端，参数设置为 2
             if (frameCount % skipFrameNum == 0)
             {
                 frameCount = 0;
