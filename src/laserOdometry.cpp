@@ -267,9 +267,9 @@ int main(int argc, char **argv)
                     ceres::LossFunction *loss_function = new ceres::HuberLoss(0.1);
                     /*  由于旋转不满足一般意义的加法，因此这里使用ceres自带的local param
                     自己定义“加法”  */
-                    ceres::LocalParameterization *q_parameterization =
+                    ceres::LocalParameterization  *q_parameterization =
                         new ceres::EigenQuaternionParameterization();
-                    ceres::Problem::Options problem_options;
+                    ceres::Problem::Options  problem_options;
 
                     ceres::Problem problem(problem_options);
                     /* 待优化的变量是帧间位姿，平移和旋转，这里旋转使用四元数来表示
@@ -496,7 +496,7 @@ int main(int argc, char **argv)
                     //printf("coner_correspondance %d, plane_correspondence %d \n", corner_correspondence, plane_correspondence);
                     printf("data association time %f ms \n", t_data.toc());
                     // 如果总的约束太少，就打印一下
-                    if ((corner_correspondence + plane_correspondence) < 10)
+                    if ( (corner_correspondence + plane_correspondence) < 10)
                     {
                         printf("less correspondence! \n");
                     }
@@ -517,7 +517,7 @@ int main(int argc, char **argv)
             }
 
             TicToc t_pub;
-            // publish odometry   发布lidar里程记结果
+            // publish odometry   发布lidar里程计结果
             nav_msgs::Odometry  laserOdometry;
             laserOdometry.header.frame_id = "/camera_init";
             laserOdometry.child_frame_id = "/laser_odom";
@@ -527,12 +527,13 @@ int main(int argc, char **argv)
             laserOdometry.pose.pose.orientation.y = q_w_curr.y();
             laserOdometry.pose.pose.orientation.z = q_w_curr.z();
             laserOdometry.pose.pose.orientation.w = q_w_curr.w();
+
             laserOdometry.pose.pose.position.x = t_w_curr.x();
             laserOdometry.pose.pose.position.y = t_w_curr.y();
             laserOdometry.pose.pose.position.z = t_w_curr.z();
             pubLaserOdometry.publish(laserOdometry);
 
-            geometry_msgs::PoseStamped  laserPose;
+            geometry_msgs::PoseStamped   laserPose;
             laserPose.header = laserOdometry.header;
             laserPose.pose = laserOdometry.pose.pose;
 
@@ -562,18 +563,18 @@ int main(int argc, char **argv)
                     TransformToEnd(&laserCloudFullRes->points[i], &laserCloudFullRes->points[i]);
                 }
             }
-
+            // laserCloudCornerLast 开始的size是0，把它和cornerPointsLessSharp交换
             pcl::PointCloud<PointType>::Ptr  laserCloudTemp = cornerPointsLessSharp;
             cornerPointsLessSharp = laserCloudCornerLast;
             laserCloudCornerLast = laserCloudTemp;
-
+            // 同理，laserCloudSurfLast开始的size是0，把它和surfPointsLessFlat交换
             laserCloudTemp = surfPointsLessFlat;
             surfPointsLessFlat = laserCloudSurfLast;
             laserCloudSurfLast = laserCloudTemp;
 
             laserCloudCornerLastNum = laserCloudCornerLast->points.size();
             laserCloudSurfLastNum = laserCloudSurfLast->points.size();
-
+            // 交换之后，这里当然不是0了
             std::cout << "the size of corner last is " << laserCloudCornerLastNum << ", and the size of surf last is " << laserCloudSurfLastNum << '\n';
             // kdtree设置当前帧，用于下一帧lidar odom使用
             kdtreeCornerLast->setInputCloud(laserCloudCornerLast);
